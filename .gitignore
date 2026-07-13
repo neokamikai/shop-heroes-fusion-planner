@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+.deploy-temp/
+apps/api/*.log
+apps/web/*.log
+apps/web/dist-deploy.zip
+apps/web/playwright-*.png
+.env
+.env.local
+.env.*.local
+apps/*/node_modules/
+apps/*/dist/
+packages/*/node_modules/
+packages/*/dist/

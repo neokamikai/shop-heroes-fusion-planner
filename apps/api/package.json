@@ -1,0 +1,20 @@
+{
+  "name": "@shop-heroes-planner/api",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "build": "node -e \"console.log('API build step not required yet')\""
+  },
+  "dependencies": {
+    "@shop-heroes-planner/database": "file:../../packages/database",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.0",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^9.0.3",
+    "ws": "^8.21.0"
+  }
+}

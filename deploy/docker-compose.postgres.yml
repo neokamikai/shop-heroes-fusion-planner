@@ -1,0 +1,15 @@
+version: "3.3"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: shop-heroes-planner-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: shop_heroes_planner
+      POSTGRES_USER: shop_heroes_planner
+      POSTGRES_PASSWORD: shop_heroes_planner_prod
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data

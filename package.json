@@ -1,0 +1,25 @@
+{
+  "name": "shop-heroes-fusion-planner",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "npm run dev --workspace @shop-heroes-planner/api",
+    "dev:web": "npm run dev --workspace @shop-heroes-planner/web",
+    "build": "npm run build --workspace @shop-heroes-planner/api && npm run build --workspace @shop-heroes-planner/web",
+    "db:migrate": "npm run migrate --workspace @shop-heroes-planner/database",
+    "db:rollback": "npm run rollback --workspace @shop-heroes-planner/database",
+    "db:seed": "npm run seed --workspace @shop-heroes-planner/database"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
+

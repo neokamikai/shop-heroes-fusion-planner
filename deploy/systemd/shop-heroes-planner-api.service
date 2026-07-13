@@ -1,0 +1,17 @@
+[Unit]
+Description=Shop Heroes Planner API
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apps/shop-heroes-planner/current/apps/api
+Environment=NODE_ENV=production
+EnvironmentFile=/home/ubuntu/apps/shop-heroes-planner/shared/.env.production
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

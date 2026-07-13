@@ -1,0 +1,17 @@
+{
+  "name": "@shop-heroes-planner/database",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "db:ensure-schema": "node ./scripts/ensure-schema.js",
+    "migrate": "npm run db:ensure-schema && knex --knexfile knexfile.js migrate:latest",
+    "rollback": "knex --knexfile knexfile.js migrate:rollback",
+    "seed": "knex --knexfile knexfile.js seed:run"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.0",
+    "knex": "^3.1.0",
+    "pg": "^8.16.3"
+  }
+}
