@@ -48,7 +48,7 @@ const latestUpdates = [
 ];
 
 const roadmapItems = [
-  'Post-login account bootstrap that can detect the running game session exposed by the mod.',
+  'Post-login account bootstrap now detects the running game session exposed by the mod and can reuse existing bindings.',
   'Workspace modules for targets, inventory, craft slots, and account sync flows.',
   'Public download and installation guidance pages once the full loop is stable enough to expose.'
 ];
@@ -230,6 +230,30 @@ function buildBindingPayloadFromDescriptor(descriptor) {
     sessionStartedAt: descriptor?.runtime?.startedAt || null,
     sessionSeenAt: new Date().toISOString()
   };
+}
+
+function isAccountBoundToDescriptor(account, descriptor) {
+  if (!account || !descriptor) {
+    return false;
+  }
+
+  if (
+    account.mcpAccountExternalId
+    && account.mcpAccountExternalId === descriptor.account?.externalId
+  ) {
+    return true;
+  }
+
+  return Boolean(
+    account.mcpInstallationId
+    && account.mcpInstallationId === descriptor.installation?.installationId
+  );
+}
+
+function findAccountMatchingDescriptor(accounts, descriptor) {
+  return (Array.isArray(accounts) ? accounts : []).find((account) => (
+    isAccountBoundToDescriptor(account, descriptor)
+  )) || null;
 }
 
 function extractJsonFromMcpToolResponse(payload) {
@@ -522,6 +546,7 @@ function App() {
   const [itemEditorDraft, setItemEditorDraft] = useState(null);
   const [isSavingItemEditor, setIsSavingItemEditor] = useState(false);
   const [accountForm, setAccountForm] = useState(ACCOUNT_FORM_INITIAL_STATE);
+  const [hasAttemptedAutoDetectLocalSession, setHasAttemptedAutoDetectLocalSession] = useState(false);
   const [isBootstrapping, setIsBootstrapping] = useState(false);
   const [isLoadingAccounts, setIsLoadingAccounts] = useState(false);
   const [isLoadingSnapshot, setIsLoadingSnapshot] = useState(false);
@@ -586,6 +611,25 @@ function App() {
 
     void loadWorkspaceData();
   }, [session, accessToken]);
+
+  useEffect(() => {
+    if (!session || !accessToken || isLoadingAccounts || hasAttemptedAutoDetectLocalSession) {
+      return;
+    }
+
+    const shouldAttemptAutoDetection = accounts.length === 0 || accounts.some((account) => account.mcpBindingMode);
+
+    if (!shouldAttemptAutoDetection) {
+      return;
+    }
+
+    setHasAttemptedAutoDetectLocalSession(true);
+    void handleDetectLocalSession({
+      silent: true,
+      applyToForm: accounts.length === 0,
+      preferMatchingAccount: true
+    });
+  }, [session, accessToken, isLoadingAccounts, hasAttemptedAutoDetectLocalSession, accounts, localMcpBaseUrl]);
 
   useEffect(() => {
     if (!session || !accessToken) {
@@ -694,6 +738,29 @@ function App() {
       window.clearInterval(intervalId);
     };
   }, [session, accessToken, accounts, selectedAccountId, localMcpBaseUrl, selectedSnapshot, tiers]);
+
+  useEffect(() => {
+    if (!localSessionDescriptor) {
+      return;
+    }
+
+    const matchingAccount = findAccountMatchingDescriptor(accounts, localSessionDescriptor);
+
+    if (!matchingAccount) {
+      return;
+    }
+
+    setSelectedAccountId((currentValue) => {
+      if (!currentValue) {
+        return matchingAccount.id;
+      }
+
+      const currentAccount = accounts.find((account) => account.id === currentValue) || null;
+      return isAccountBoundToDescriptor(currentAccount, localSessionDescriptor)
+        ? currentValue
+        : matchingAccount.id;
+    });
+  }, [accounts, localSessionDescriptor]);
 
   useEffect(() => {
     if (!workspaceItems.length) {
@@ -852,10 +919,11 @@ function App() {
       setAccounts(accountsResponse);
       setCategories(categoriesResponse);
       setTiers(tiersResponse);
+      const matchingDetectedAccount = findAccountMatchingDescriptor(accountsResponse, localSessionDescriptor);
       setSelectedAccountId((currentValue) => (
         accountsResponse.some((account) => account.id === currentValue)
           ? currentValue
-          : (accountsResponse[0]?.id || null)
+          : (matchingDetectedAccount?.id || accountsResponse[0]?.id || null)
       ));
     } catch (error) {
       if (error.statusCode === 401) {
@@ -986,10 +1054,19 @@ function App() {
     return allItems;
   }
 
-  async function handleDetectLocalSession() {
-    setErrorMessage('');
-    setSuccessMessage('');
-    setLocalSessionMessage('');
+  async function handleDetectLocalSession(options = {}) {
+    const {
+      silent = false,
+      applyToForm = true,
+      preferMatchingAccount = true
+    } = options;
+
+    if (!silent) {
+      setErrorMessage('');
+      setSuccessMessage('');
+      setLocalSessionMessage('');
+    }
+
     setIsDetectingLocalSession(true);
 
     try {
@@ -1006,16 +1083,45 @@ function App() {
       }
 
       setLocalSessionDescriptor(descriptor);
-      setAccountForm((currentValue) => ({
-        ...currentValue,
-        ...buildAccountFormFromDescriptor(descriptor)
-      }));
-      setLocalSessionMessage('Local Shop Heroes session detected. The bootstrap form was pre-filled from the running game.');
+
+      if (applyToForm) {
+        setAccountForm((currentValue) => ({
+          ...currentValue,
+          ...buildAccountFormFromDescriptor(descriptor)
+        }));
+      }
+
+      const matchingAccount = preferMatchingAccount
+        ? findAccountMatchingDescriptor(accounts, descriptor)
+        : null;
+
+      if (matchingAccount) {
+        setSelectedAccountId(matchingAccount.id);
+      }
+
+      if (!silent || matchingAccount || applyToForm) {
+        setLocalSessionMessage(
+          matchingAccount
+            ? `Local Shop Heroes session detected and matched to "${matchingAccount.name}".`
+            : (
+                applyToForm
+                  ? 'Local Shop Heroes session detected. The bootstrap form was pre-filled from the running game.'
+                  : 'Local Shop Heroes session detected.'
+              )
+        );
+      }
+
+      return descriptor;
     } catch (error) {
       setLocalSessionDescriptor(null);
-      setLocalSessionMessage(
-        `${error.message} If the local MCP is running but this still fails in the browser, the local HTTP bridge likely still needs browser-access headers enabled.`
-      );
+
+      if (!silent) {
+        setLocalSessionMessage(
+          `${error.message} If the local MCP is running but this still fails in the browser, the local HTTP bridge likely still needs browser-access headers enabled.`
+        );
+      }
+
+      return null;
     } finally {
       setIsDetectingLocalSession(false);
     }
@@ -2083,7 +2189,10 @@ function App() {
     setSelectedSnapshot(null);
     setLocalSessionDescriptor(null);
     setLocalPlannerOverview(null);
+    setLocalFullSnapshot(null);
     setLocalHeroesSnapshot([]);
+    setAccountForm(ACCOUNT_FORM_INITIAL_STATE);
+    setHasAttemptedAutoDetectLocalSession(false);
     setAssistantPrompt('');
     setAssistantResponse('');
     setAssistantModel('');
@@ -2100,20 +2209,7 @@ function App() {
 
   const selectedAccount = accounts.find((account) => account.id === selectedAccountId) || null;
   const selectedWorkspaceItem = workspaceItems.find((item) => item.id === selectedWorkspaceItemId) || null;
-  const isDetectedSessionAlignedWithSelectedAccount = Boolean(
-    selectedAccount
-    && localSessionDescriptor
-    && (
-      (
-        selectedAccount.mcpAccountExternalId
-        && selectedAccount.mcpAccountExternalId === localSessionDescriptor.account?.externalId
-      )
-      || (
-        selectedAccount.mcpInstallationId
-        && selectedAccount.mcpInstallationId === localSessionDescriptor.installation?.installationId
-      )
-      )
-  );
+  const isDetectedSessionAlignedWithSelectedAccount = isAccountBoundToDescriptor(selectedAccount, localSessionDescriptor);
   const shouldPreferLocalRosterInOverview = isDetectedSessionAlignedWithSelectedAccount && localHeroesSnapshot.length > 0;
   const overviewRosterEntries = shouldPreferLocalRosterInOverview
     ? localHeroesSnapshot
@@ -2412,7 +2508,7 @@ function App() {
               <h1>Now we can bootstrap your real game accounts.</h1>
               <p className="hero-copy">
                 You are inside the platform shell now. The next step is binding or creating
-                a Shop Heroes game account entry, and later we will detect the running modded session automatically.
+                a Shop Heroes game account entry. If the local modded session is reachable, we can detect it here and reuse that context while you bootstrap the account.
               </p>
             </div>
 

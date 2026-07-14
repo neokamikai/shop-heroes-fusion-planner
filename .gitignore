@@ -6,6 +6,7 @@ apps/api/*.log
 apps/web/*.log
 apps/web/dist-deploy.zip
 apps/web/playwright-*.png
+.codex-logs/
 .env
 .env.local
 .env.*.local
