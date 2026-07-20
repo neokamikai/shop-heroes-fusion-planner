@@ -256,6 +256,15 @@ function findAccountMatchingDescriptor(accounts, descriptor) {
   )) || null;
 }
 
+function buildLocalFetchOptions(overrides = {}) {
+  return {
+    ...overrides,
+    // Chrome's Local Network Access flow recognizes this hint for secure
+    // public pages that intentionally need to reach a local loopback bridge.
+    targetAddressSpace: 'local'
+  };
+}
+
 function extractJsonFromMcpToolResponse(payload) {
   if (!payload || typeof payload !== 'object') {
     throw new Error('Local MCP returned an empty response.');
@@ -286,7 +295,7 @@ function extractJsonFromMcpToolResponse(payload) {
 
 async function requestLocalMcpTool(baseUrl, toolName, args = {}) {
   const endpointUrl = `${normalizeLocalMcpBaseUrl(baseUrl)}/mcp`;
-  const response = await fetch(endpointUrl, {
+  const response = await fetch(endpointUrl, buildLocalFetchOptions({
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -302,7 +311,7 @@ async function requestLocalMcpTool(baseUrl, toolName, args = {}) {
         arguments: args
       }
     })
-  });
+  }));
 
   if (!response.ok) {
     let errorPayload = null;
@@ -335,12 +344,12 @@ async function requestLocalBrowserJson(baseUrl, routePath, query = {}) {
     }
   });
 
-  const response = await fetch(endpointUrl.toString(), {
+  const response = await fetch(endpointUrl.toString(), buildLocalFetchOptions({
     method: 'GET',
     headers: {
       Accept: 'application/json'
     }
-  });
+  }));
 
   if (!response.ok) {
     let errorPayload = null;
@@ -1348,6 +1357,7 @@ function App() {
       const normalizedSnapshot = fullSnapshot?.snapshot || fullSnapshot;
       const localHeroes = Array.isArray(normalizedSnapshot?.heroes) ? normalizedSnapshot.heroes : [];
       const localCraftableItems = Array.isArray(normalizedSnapshot?.craftableItems) ? normalizedSnapshot.craftableItems : [];
+      const localInventoryItems = Array.isArray(normalizedSnapshot?.inventoryItems) ? normalizedSnapshot.inventoryItems : [];
       setLocalHeroesSnapshot(localHeroes);
 
       const accountCharacters = Array.isArray(selectedSnapshot.characters) ? selectedSnapshot.characters : [];
@@ -1445,7 +1455,13 @@ function App() {
           });
         }
 
-        const availabilityByQuality = buildLocalAvailabilityByQuality(localItem);
+        const matchingInventoryItem = localInventoryItems.find((inventoryItem) => {
+          return (
+            String(inventoryItem?.uid || '').trim().toLowerCase() === String(localItem?.uid || '').trim().toLowerCase()
+            || normalizeLookupKey(inventoryItem?.name) === normalizeLookupKey(localItem?.name)
+          );
+        });
+        const availabilityByQuality = buildLocalAvailabilityByQuality(matchingInventoryItem || localItem);
 
         for (const [qualityIndex, tier] of tierByQualityIndex.entries()) {
           const quantity = availabilityByQuality.get(Number(qualityIndex)) ?? 0;

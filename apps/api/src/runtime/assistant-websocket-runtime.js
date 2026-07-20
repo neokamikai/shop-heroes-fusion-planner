@@ -314,10 +314,49 @@ async function executeAssistantRun({
       });
     }
 
-    if (analysis.heroName) {
+    if (analysis.requestType === 'item_usability_review') {
+      const itemUsabilityReview = assistantService.buildItemUsabilityReview({
+        analysis,
+        localFullSnapshot,
+        localHeroesSnapshot
+      });
+
+      emitRunEvent({
+        type: 'assistant.run.tool_started',
+        toolName: 'item_usability_evidence',
+        message: `Resolving item usability evidence for ${analysis.itemName || 'the requested item'}.`,
+        inputSummary: {
+          itemName: analysis.itemName || '',
+          liveHeroesAvailable: localHeroesSnapshot.length
+        }
+      });
+
+      emitRunEvent({
+        type: 'assistant.run.tool_finished',
+        toolName: 'item_usability_evidence',
+        message: itemUsabilityReview?.item
+          ? `${itemUsabilityReview.item.name} matched to ${itemUsabilityReview.availableHeroes.length} currently available compatible hero(es).`
+          : 'The requested item could not be matched in the live snapshot.',
+        resultSummary: {
+          itemFound: Boolean(itemUsabilityReview?.item),
+          itemTypeCode: itemUsabilityReview?.item?.itemTypeCode || '',
+          availableHeroes: itemUsabilityReview?.availableHeroes?.length || 0,
+          unavailableHeroes: itemUsabilityReview?.unavailableHeroes?.length || 0
+        }
+      });
+
+      emitRunEvent({
+        type: 'assistant.run.progress',
+        phase: 'querying_equipment',
+        stepIndex: 4,
+        stepCount: 5,
+        message: `Checking which heroes expose proficiency for ${analysis.itemName || 'the requested item'}.`
+      });
+    } else if (analysis.heroName) {
       const focusedHeroReview = assistantService.buildFocusedHeroReview({
         analysis,
         snapshot,
+        localFullSnapshot,
         localHeroesSnapshot
       });
 
@@ -339,7 +378,9 @@ async function executeAssistantRun({
           heroFound: Boolean(focusedHeroReview?.liveHero),
           equippedItems: focusedHeroReview?.equipmentSummary?.equippedCount || 0,
           allBreakChanceZero: Boolean(focusedHeroReview?.equipmentSummary?.allBreakChanceZero),
-          highestBreakChance: focusedHeroReview?.equipmentSummary?.highestBreakChance || 0
+          highestBreakChance: focusedHeroReview?.equipmentSummary?.highestBreakChance || 0,
+          craftableCandidatesAvailable: focusedHeroReview?.localCraftableItems?.length || 0,
+          shopInventoryItemsAvailable: focusedHeroReview?.shopInventoryItems?.length || 0
         }
       });
 
