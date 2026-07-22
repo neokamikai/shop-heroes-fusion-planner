@@ -4,8 +4,9 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL
   || (import.meta.env.DEV ? 'http://127.0.0.1:3001' : '/shop-heroes-planner/api');
 const ITEM_PAGE_SIZE = 12;
 const ACCESS_TOKEN_STORAGE_KEY = 'shop_heroes_planner_access_token';
-const LOCAL_MCP_BASE_URL_STORAGE_KEY = 'shop_heroes_planner_local_mcp_base_url';
-const LOCAL_MCP_DEFAULT_BASE_URL = 'http://127.0.0.1:8787';
+const LOCAL_BRIDGE_WS_URL_STORAGE_KEY = 'shop_heroes_planner_local_bridge_ws_url';
+const LEGACY_LOCAL_MCP_BASE_URL_STORAGE_KEY = 'shop_heroes_planner_local_mcp_base_url';
+const LOCAL_BRIDGE_DEFAULT_WS_URL = 'ws://127.0.0.1:8765/data';
 const MCP_PROTOCOL_VERSION = '2025-11-25';
 const ACCOUNT_FORM_INITIAL_STATE = {
   accountName: '',
@@ -74,25 +75,53 @@ function writeAccessToken(token) {
   window.sessionStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, token);
 }
 
-function readLocalMcpBaseUrl() {
+function readLocalBridgeWebSocketUrl() {
   if (typeof window === 'undefined') {
-    return LOCAL_MCP_DEFAULT_BASE_URL;
+    return LOCAL_BRIDGE_DEFAULT_WS_URL;
   }
 
-  return window.localStorage.getItem(LOCAL_MCP_BASE_URL_STORAGE_KEY) || LOCAL_MCP_DEFAULT_BASE_URL;
+  return (
+    window.localStorage.getItem(LOCAL_BRIDGE_WS_URL_STORAGE_KEY)
+    || convertLegacyLocalMcpUrlToBridgeWebSocketUrl(window.localStorage.getItem(LEGACY_LOCAL_MCP_BASE_URL_STORAGE_KEY))
+    || LOCAL_BRIDGE_DEFAULT_WS_URL
+  );
 }
 
-function writeLocalMcpBaseUrl(value) {
+function writeLocalBridgeWebSocketUrl(value) {
   if (typeof window === 'undefined') {
     return;
   }
 
-  window.localStorage.setItem(LOCAL_MCP_BASE_URL_STORAGE_KEY, value);
+  window.localStorage.setItem(LOCAL_BRIDGE_WS_URL_STORAGE_KEY, value);
+}
+
+function normalizeLocalBridgeWebSocketUrl(value) {
+  const normalized = String(value || '').trim().replace(/\/+$/, '');
+  return normalized || LOCAL_BRIDGE_DEFAULT_WS_URL;
+}
+
+function convertLegacyLocalMcpUrlToBridgeWebSocketUrl(value) {
+  const normalized = String(value || '').trim();
+
+  if (!normalized) {
+    return '';
+  }
+
+  try {
+    const url = new URL(normalized);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.port = url.port === '8787' || !url.port ? '8765' : url.port;
+    url.pathname = '/data';
+    url.search = '';
+    url.hash = '';
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
 }
 
 function normalizeLocalMcpBaseUrl(value) {
-  const normalized = String(value || '').trim().replace(/\/+$/, '');
-  return normalized || LOCAL_MCP_DEFAULT_BASE_URL;
+  return normalizeLocalBridgeWebSocketUrl(value);
 }
 
 function normalizeLookupKey(value) {
@@ -213,7 +242,7 @@ function buildAccountFormFromDescriptor(descriptor) {
     accountName: descriptor?.account?.displayName || descriptor?.installation?.installationLabel || '',
     platform: mapInstallationTypeToPlatform(descriptor?.installation?.installationType),
     notes: descriptor?.installation?.installationLabel
-      ? `Bound from local MCP session on ${descriptor.installation.installationLabel}`
+      ? `Bound from local Shop Heroes bridge session on ${descriptor.installation.installationLabel}`
       : ''
   };
 }
@@ -368,6 +397,96 @@ async function requestLocalBrowserJson(baseUrl, routePath, query = {}) {
   return response.json();
 }
 
+function normalizeBridgePayload(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeBridgePayload(entry));
+  }
+
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entryValue]) => [
+      key.charAt(0).toLowerCase() + key.slice(1),
+      normalizeBridgePayload(entryValue)
+    ])
+  );
+}
+
+function requestLocalBridgeSnapshot(webSocketUrl, options = {}) {
+  const { requestRefresh = false, timeoutMs = 10000 } = options;
+  const endpointUrl = normalizeLocalBridgeWebSocketUrl(webSocketUrl);
+
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.WebSocket) {
+      reject(new Error('This browser does not support WebSocket connections.'));
+      return;
+    }
+
+    const socket = new window.WebSocket(endpointUrl);
+    let hasSettled = false;
+    const timeoutId = window.setTimeout(() => {
+      settleWithError(new Error(`Local Shop Heroes bridge did not respond at ${endpointUrl}.`));
+    }, timeoutMs);
+
+    function cleanup() {
+      window.clearTimeout(timeoutId);
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.onclose = null;
+
+      if (socket.readyState === window.WebSocket.OPEN || socket.readyState === window.WebSocket.CONNECTING) {
+        socket.close();
+      }
+    }
+
+    function settleWithValue(value) {
+      if (hasSettled) {
+        return;
+      }
+
+      hasSettled = true;
+      cleanup();
+      resolve(value);
+    }
+
+    function settleWithError(error) {
+      if (hasSettled) {
+        return;
+      }
+
+      hasSettled = true;
+      cleanup();
+      reject(error);
+    }
+
+    socket.onopen = () => {
+      if (requestRefresh) {
+        socket.send('get_full_data');
+      }
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        settleWithValue(normalizeBridgePayload(payload));
+      } catch {
+        settleWithError(new Error('Local Shop Heroes bridge returned a non-JSON message.'));
+      }
+    };
+
+    socket.onerror = () => {
+      settleWithError(new Error(`Could not connect to local Shop Heroes bridge at ${endpointUrl}.`));
+    };
+
+    socket.onclose = () => {
+      settleWithError(new Error(`Local Shop Heroes bridge closed before sending a snapshot from ${endpointUrl}.`));
+    };
+  });
+}
+
 async function requestJson(path, options = {}) {
   const token = options.accessToken ?? readAccessToken();
   const headers = {
@@ -406,16 +525,67 @@ async function requestJson(path, options = {}) {
   return response.json();
 }
 
-async function fetchLocalFullSnapshot(baseUrl) {
-  try {
-    return await requestLocalBrowserJson(baseUrl, '/browser/full-snapshot', {
-      forceRefresh: true
-    });
-  } catch {
-    return requestLocalMcpTool(baseUrl, 'get_full_snapshot', {
-      forceRefresh: true
-    });
-  }
+async function fetchLocalFullSnapshot(webSocketUrl) {
+  return requestLocalBridgeSnapshot(webSocketUrl, {
+    requestRefresh: true
+  });
+}
+
+function buildLocalPlannerOverviewFromSnapshot(snapshot) {
+  const heroes = Array.isArray(snapshot?.heroes) ? snapshot.heroes : [];
+  const craftSlots = Array.isArray(snapshot?.craftSlots) ? snapshot.craftSlots : [];
+  const fusionSlots = Array.isArray(snapshot?.fusionSlots) ? snapshot.fusionSlots : [];
+  const questSlots = Array.isArray(snapshot?.questSlots) ? snapshot.questSlots : [];
+  const tradeSlots = Array.isArray(snapshot?.tradeSlots) ? snapshot.tradeSlots : [];
+  const cityTradeSlots = Array.isArray(snapshot?.cityTradeSlots) ? snapshot.cityTradeSlots : [];
+  const readyOperations = [
+    ...buildLocalOperations(craftSlots, 'craft').filter((operation) => operation.status === 'ready'),
+    ...buildLocalOperations(fusionSlots, 'fusion').filter((operation) => operation.status === 'ready'),
+    ...buildLocalOperations(questSlots, 'quest').filter((operation) => operation.status === 'ready'),
+    ...buildLocalOperations(tradeSlots, 'trade').filter((operation) => operation.status === 'ready'),
+    ...buildLocalOperations(cityTradeSlots, 'city_trade').filter((operation) => operation.status === 'ready')
+  ];
+  const activeOperations = [
+    ...buildLocalOperations(craftSlots, 'craft').filter((operation) => operation.status === 'running'),
+    ...buildLocalOperations(fusionSlots, 'fusion').filter((operation) => operation.status === 'running'),
+    ...buildLocalOperations(questSlots, 'quest').filter((operation) => operation.status === 'running'),
+    ...buildLocalOperations(tradeSlots, 'trade').filter((operation) => operation.status === 'running'),
+    ...buildLocalOperations(cityTradeSlots, 'city_trade').filter((operation) => operation.status === 'running')
+  ];
+
+  return {
+    timestamp: snapshot?.timestamp || new Date().toISOString(),
+    summary: {
+      heroCount: heroes.length,
+      readyHeroes: heroes.filter(isLocalHeroOperationallyReady).length,
+      readyCrafts: readyOperations.filter((operation) => operation.category === 'craft').length,
+      readyFusions: readyOperations.filter((operation) => operation.category === 'fusion').length
+    },
+    readyOperations,
+    activeOperations,
+    recommendations: []
+  };
+}
+
+function buildLocalOperations(slots, category) {
+  return (Array.isArray(slots) ? slots : [])
+    .map((slot, index) => {
+      const name = slot?.itemName || slot?.name || slot?.heroName || slot?.customerName || 'Unknown';
+      const isReady = Boolean(slot?.isReady || slot?.ready || slot?.canCollect);
+      const isRunning = Boolean(slot?.isActive || slot?.active || slot?.isRunning || slot?.remainingSeconds || slot?.remainingMs);
+
+      if (!isReady && !isRunning) {
+        return null;
+      }
+
+      return {
+        category,
+        index,
+        name,
+        status: isReady ? 'ready' : 'running'
+      };
+    })
+    .filter(Boolean);
 }
 
 function buildAssistantWebSocketUrl(apiBaseUrl) {
@@ -518,7 +688,7 @@ function App() {
     search: '',
     category: ''
   });
-  const [localMcpBaseUrl, setLocalMcpBaseUrl] = useState(() => readLocalMcpBaseUrl());
+  const [localBridgeWebSocketUrl, setLocalBridgeWebSocketUrl] = useState(() => readLocalBridgeWebSocketUrl());
   const [localSessionDescriptor, setLocalSessionDescriptor] = useState(null);
   const [localPlannerOverview, setLocalPlannerOverview] = useState(null);
   const [localHeroesSnapshot, setLocalHeroesSnapshot] = useState([]);
@@ -574,8 +744,8 @@ function App() {
   }, [accessToken]);
 
   useEffect(() => {
-    writeLocalMcpBaseUrl(normalizeLocalMcpBaseUrl(localMcpBaseUrl));
-  }, [localMcpBaseUrl]);
+    writeLocalBridgeWebSocketUrl(normalizeLocalBridgeWebSocketUrl(localBridgeWebSocketUrl));
+  }, [localBridgeWebSocketUrl]);
 
   useEffect(() => {
     if (verificationResendCooldownSeconds <= 0) {
@@ -638,7 +808,7 @@ function App() {
       applyToForm: accounts.length === 0,
       preferMatchingAccount: true
     });
-  }, [session, accessToken, isLoadingAccounts, hasAttemptedAutoDetectLocalSession, accounts, localMcpBaseUrl]);
+  }, [session, accessToken, isLoadingAccounts, hasAttemptedAutoDetectLocalSession, accounts, localBridgeWebSocketUrl]);
 
   useEffect(() => {
     if (!session || !accessToken) {
@@ -699,19 +869,11 @@ function App() {
 
     const pollLocalState = async () => {
       try {
-        let descriptor;
-        let overview;
+        const snapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
+        const descriptor = snapshot?.sessionDescriptor || null;
+        const overview = buildLocalPlannerOverviewFromSnapshot(snapshot);
 
-        try {
-          [descriptor, overview] = await Promise.all([
-            requestLocalBrowserJson(localMcpBaseUrl, '/browser/session-descriptor', {
-              forceRefresh: true
-            }),
-            requestLocalBrowserJson(localMcpBaseUrl, '/browser/planner-overview', {
-              forceRefresh: true
-            })
-          ]);
-        } catch {
+        if (!descriptor) {
           return;
         }
 
@@ -746,7 +908,7 @@ function App() {
       isCancelled = true;
       window.clearInterval(intervalId);
     };
-  }, [session, accessToken, accounts, selectedAccountId, localMcpBaseUrl, selectedSnapshot, tiers]);
+  }, [session, accessToken, accounts, selectedAccountId, localBridgeWebSocketUrl, selectedSnapshot, tiers]);
 
   useEffect(() => {
     if (!localSessionDescriptor) {
@@ -1079,19 +1241,17 @@ function App() {
     setIsDetectingLocalSession(true);
 
     try {
-      let descriptor;
+      const fullSnapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
+      const descriptor = fullSnapshot?.sessionDescriptor || null;
 
-      try {
-        descriptor = await requestLocalBrowserJson(localMcpBaseUrl, '/browser/session-descriptor', {
-          forceRefresh: true
-        });
-      } catch {
-        descriptor = await requestLocalMcpTool(localMcpBaseUrl, 'get_session_descriptor', {
-          forceRefresh: true
-        });
+      if (!descriptor) {
+        throw new Error('Local Shop Heroes bridge did not expose a session descriptor yet.');
       }
 
       setLocalSessionDescriptor(descriptor);
+      setLocalFullSnapshot(fullSnapshot);
+      setLocalHeroesSnapshot(Array.isArray(fullSnapshot?.heroes) ? fullSnapshot.heroes : []);
+      setLocalPlannerOverview(buildLocalPlannerOverviewFromSnapshot(fullSnapshot));
 
       if (applyToForm) {
         setAccountForm((currentValue) => ({
@@ -1126,7 +1286,7 @@ function App() {
 
       if (!silent) {
         setLocalSessionMessage(
-          `${error.message} If the local MCP is running but this still fails in the browser, the local HTTP bridge likely still needs browser-access headers enabled.`
+          `${error.message} Check whether the Shop Heroes mod is running and exposing the bridge websocket configured above.`
         );
       }
 
@@ -1170,7 +1330,7 @@ function App() {
 
       setAccounts(refreshedAccounts);
       await refreshSelectedAccountSnapshot(accountId);
-      setSuccessMessage('Local MCP session is now bound to this planner account.');
+      setSuccessMessage('Local bridge session is now bound to this planner account.');
     } catch (error) {
       if (error.statusCode === 401) {
         handleSessionExpired();
@@ -1190,25 +1350,8 @@ function App() {
     setIsLoadingLocalPlannerOverview(true);
 
     try {
-      let overview;
-      let fullSnapshot = null;
-
-      try {
-        overview = await requestLocalBrowserJson(localMcpBaseUrl, '/browser/planner-overview', {
-          forceRefresh: true
-        });
-      } catch {
-        overview = await requestLocalMcpTool(localMcpBaseUrl, 'get_planner_overview', {
-          forceRefresh: true
-        });
-      }
-
-      try {
-        fullSnapshot = await fetchLocalFullSnapshot(localMcpBaseUrl);
-      } catch {
-        fullSnapshot = null;
-      }
-
+      const fullSnapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
+      const overview = buildLocalPlannerOverviewFromSnapshot(fullSnapshot);
       setLocalPlannerOverview(overview);
       if (fullSnapshot) {
         const normalizedSnapshot = fullSnapshot?.snapshot || fullSnapshot;
@@ -1220,7 +1363,7 @@ function App() {
     } catch (error) {
       setLocalPlannerOverview(null);
       setLocalSessionMessage(
-        `${error.message} If this is happening from the remote planner URL, the local MCP HTTP server probably still needs browser-access support.`
+        `${error.message} Check whether the Shop Heroes mod websocket is listening at the configured URL.`
       );
     } finally {
       setIsLoadingLocalPlannerOverview(false);
@@ -1244,17 +1387,7 @@ function App() {
     }
 
     try {
-      let fullSnapshot;
-
-      try {
-        fullSnapshot = await requestLocalBrowserJson(localMcpBaseUrl, '/browser/full-snapshot', {
-          forceRefresh: true
-        });
-      } catch {
-        fullSnapshot = await requestLocalMcpTool(localMcpBaseUrl, 'get_full_snapshot', {
-          forceRefresh: true
-        });
-      }
+      const fullSnapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
       const normalizedSnapshot = fullSnapshot?.snapshot || fullSnapshot;
       const localHeroes = Array.isArray(normalizedSnapshot?.heroes) ? normalizedSnapshot.heroes : [];
       setLocalFullSnapshot(normalizedSnapshot);
@@ -1342,17 +1475,7 @@ function App() {
     }
 
     try {
-      let fullSnapshot;
-
-      try {
-        fullSnapshot = await requestLocalBrowserJson(localMcpBaseUrl, '/browser/full-snapshot', {
-          forceRefresh: true
-        });
-      } catch {
-        fullSnapshot = await requestLocalMcpTool(localMcpBaseUrl, 'get_full_snapshot', {
-          forceRefresh: true
-        });
-      }
+      const fullSnapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
 
       const normalizedSnapshot = fullSnapshot?.snapshot || fullSnapshot;
       const localHeroes = Array.isArray(normalizedSnapshot?.heroes) ? normalizedSnapshot.heroes : [];
@@ -1563,7 +1686,7 @@ function App() {
         || nextLocalHeroesSnapshot.length === 0
         || !nextLocalFullSnapshot
       ) {
-        const fullSnapshot = await fetchLocalFullSnapshot(localMcpBaseUrl);
+        const fullSnapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
         const normalizedSnapshot = fullSnapshot?.snapshot || fullSnapshot;
         nextLocalFullSnapshot = normalizedSnapshot;
         nextLocalHeroesSnapshot = Array.isArray(normalizedSnapshot?.heroes) ? normalizedSnapshot.heroes : [];
@@ -1788,7 +1911,7 @@ function App() {
 
       setAccounts(refreshedAccounts);
       await refreshSelectedAccountSnapshot(accountId);
-      setSuccessMessage('Local MCP binding cleared for this planner account.');
+      setSuccessMessage('Local bridge binding cleared for this planner account.');
     } catch (error) {
       if (error.statusCode === 401) {
         handleSessionExpired();
@@ -2643,26 +2766,26 @@ function App() {
               <div className="note-card setup-note-card">
                 <strong>Local session bootstrap</strong>
                 <p>
-                  If the local Shop Heroes MCP is available on your machine, we can detect the running session here and pre-fill the game account before you create or bind it.
+                  If the Shop Heroes mod bridge is running on your machine, we can detect the websocket session here and pre-fill the game account before you create or bind it.
                 </p>
               </div>
 
               <div className="panel-card local-session-card">
                 <div className="panel-header">
                   <div>
-                    <p className="section-kicker">Local MCP</p>
+                    <p className="section-kicker">Local bridge</p>
                     <h3>Detect running game session</h3>
                   </div>
                   <span>{localSessionDescriptor ? 'Detected' : 'Idle'}</span>
                 </div>
 
                 <label className="field">
-                  <span>Local MCP base URL</span>
+                  <span>Shop Heroes bridge WebSocket URL</span>
                   <input
                     type="text"
-                    value={localMcpBaseUrl}
-                    onChange={(event) => setLocalMcpBaseUrl(event.target.value)}
-                    placeholder={LOCAL_MCP_DEFAULT_BASE_URL}
+                    value={localBridgeWebSocketUrl}
+                    onChange={(event) => setLocalBridgeWebSocketUrl(event.target.value)}
+                    placeholder={LOCAL_BRIDGE_DEFAULT_WS_URL}
                   />
                 </label>
 
@@ -2829,7 +2952,7 @@ function App() {
                       <p><strong>User:</strong> {selectedAccount.userDisplayName}</p>
                       <p><strong>Created:</strong> {formatDate(selectedAccount.createdAt)}</p>
                       <p><strong>Last updated:</strong> {formatDate(selectedAccount.updatedAt)}</p>
-                      <p><strong>MCP binding:</strong> {selectedAccountBindingLabel}</p>
+                      <p><strong>Local bridge binding:</strong> {selectedAccountBindingLabel}</p>
                       <p><strong>Bound account:</strong> {selectedAccount.mcpAccountDisplayName || selectedAccount.mcpAccountExternalId || 'Not bound yet'}</p>
                       <p><strong>Installation:</strong> {selectedAccount.mcpInstallationLabel || selectedAccount.mcpInstallationType || 'Not bound yet'}</p>
                       <p><strong>Last local session:</strong> {formatDate(selectedAccount.mcpLastSessionSeenAt)}</p>
@@ -3546,7 +3669,7 @@ function App() {
                     <div className="note-card">
                       <strong>Next product step</strong>
                       <p>
-                        This workspace already reflects account state, local MCP binding, a first local roster sync, and an Ollama-ready assistant scaffold. The next useful layer after this is wiring targets, crafts and fusions into equally editable modules.
+                        This workspace already reflects account state, local bridge binding, a first local roster sync, and an Ollama-ready assistant scaffold. The next useful layer after this is wiring targets, crafts and fusions into equally editable modules.
                       </p>
                     </div>
                   </>
