@@ -29,7 +29,9 @@ class AssistantService {
     const resolvedAnalysis = analysis || this.analyzePrompt({
       prompt,
       snapshot,
-      localPlannerOverview
+      localPlannerOverview,
+      localFullSnapshot,
+      localHeroesSnapshot
     });
     const assistantContext = this.buildAssistantContext({
       prompt,
@@ -134,17 +136,23 @@ class AssistantService {
   analyzePrompt({
     prompt,
     snapshot = null,
-    localPlannerOverview = null
+    localPlannerOverview = null,
+    localFullSnapshot = null,
+    localHeroesSnapshot = []
   }) {
     const normalizedPrompt = String(prompt || '').trim();
     const lowerPrompt = normalizedPrompt.toLowerCase();
     const heroName = this.inferHeroName({
       prompt: normalizedPrompt,
       snapshot,
-      localPlannerOverview
+      localPlannerOverview,
+      localFullSnapshot,
+      localHeroesSnapshot
     });
     const itemName = this.inferItemNameFromPrompt(normalizedPrompt);
+    const requestedSlot = this.inferRequestedEquipmentSlot(normalizedPrompt);
     const needsItemUsabilityReview = /\bquem pode usar\b|\bwho can use\b|\bquais? (?:herois|heroes|personagens).*\busar\b|\bpode usar\b|\bpodem usar\b/.test(lowerPrompt);
+    const needsBestItemReview = /\bmelhor\b|\bbest\b|\brecomenda|\brecommend|\bideal\b|\botimiz/.test(lowerPrompt) && Boolean(heroName && requestedSlot);
     const needsEquipmentReview = /\bequip|\bgear|\bbreak chance|\bbroken|\bweapon|\barmor|\barmour|\bitem|\bequipamento|\bequipar|\bquebra|\barmadura|\barma/.test(lowerPrompt);
     const needsBreakChanceReview = /\bbreak chance\b|\bchance de quebra\b|\bquebra em 0\b|\bquebra 0\b|\b0%\b|\bzero\b/.test(lowerPrompt);
     const planSteps = [
@@ -155,6 +163,8 @@ class AssistantService {
         : 'Proceed without local live session support if none is available.',
       needsItemUsabilityReview
         ? `Resolve which heroes can use ${itemName || 'the requested item'}.`
+        : needsBestItemReview
+        ? `Rank ${requestedSlot.label} candidates for ${heroName}.`
         : heroName
         ? `Inspect focused information for ${heroName}.`
         : 'Inspect the most relevant entities for the question.',
@@ -168,16 +178,21 @@ class AssistantService {
     return {
       heroName,
       itemName,
+      requestedSlot,
       needsEquipmentReview,
       needsBreakChanceReview,
       needsItemUsabilityReview,
+      needsBestItemReview,
       goalType: needsBreakChanceReview ? 'zero_break_chance' : 'general_equipment_review',
       requestType: needsItemUsabilityReview
         ? 'item_usability_review'
+        : needsBestItemReview ? 'hero_slot_recommendation'
         : heroName && needsEquipmentReview ? 'hero_equipment_review' : 'general_planner_question',
       planSteps,
       summary: needsItemUsabilityReview
         ? `This run will identify which heroes can use ${itemName || 'the requested item'} from the live item/proficiency data.`
+        : needsBestItemReview
+        ? `This run will rank ${requestedSlot.label} candidates for ${heroName} using live inventory, craftable items and break chance data.`
         : heroName
         ? `This run will focus on ${heroName}${needsBreakChanceReview ? ' and check the break chance implications of the equipped gear.' : ' and review the most relevant account and live-session context.'}`
         : 'This run will review the relevant planner and live-session context for the question before answering.'
@@ -205,7 +220,9 @@ class AssistantService {
     const resolvedAnalysis = analysis || this.analyzePrompt({
       prompt,
       snapshot,
-      localPlannerOverview
+      localPlannerOverview,
+      localFullSnapshot,
+      localHeroesSnapshot
     });
     const unlockedCharacters = (snapshot?.characters || [])
       .filter((character) => character.isUnlocked)
@@ -273,12 +290,19 @@ class AssistantService {
       localFullSnapshot,
       localHeroesSnapshot
     });
+    const heroSlotRecommendationReview = this.buildHeroSlotRecommendationReview({
+      analysis: resolvedAnalysis,
+      snapshot,
+      localFullSnapshot,
+      localHeroesSnapshot
+    });
     const investigationPlan = this.buildInvestigationPlan({
       analysis: resolvedAnalysis,
       snapshot,
       localFullSnapshot,
       focusedHeroReview,
-      itemUsabilityReview
+      itemUsabilityReview,
+      heroSlotRecommendationReview
     });
 
     return {
@@ -324,6 +348,7 @@ class AssistantService {
       investigationPlan,
       focusedHeroReview,
       itemUsabilityReview,
+      heroSlotRecommendationReview,
       localLiveSnapshotSummary: localFullSnapshot
         ? {
             craftableItems: Array.isArray(localFullSnapshot.craftableItems) ? localFullSnapshot.craftableItems.length : 0,
@@ -354,11 +379,20 @@ class AssistantService {
     const analysis = context?.requestAnalysis;
     const focusedHeroReview = context?.focusedHeroReview;
     const itemUsabilityReview = context?.itemUsabilityReview;
+    const heroSlotRecommendationReview = context?.heroSlotRecommendationReview;
 
     if (analysis?.requestType === 'item_usability_review') {
       return this.buildItemUsabilityResponse({
         analysis,
         itemUsabilityReview,
+        investigationPlan: context?.investigationPlan
+      });
+    }
+
+    if (analysis?.requestType === 'hero_slot_recommendation') {
+      return this.buildHeroSlotRecommendationResponse({
+        analysis,
+        heroSlotRecommendationReview,
         investigationPlan: context?.investigationPlan
       });
     }
@@ -520,6 +554,220 @@ class AssistantService {
     lines.push('Leitura importante: estou usando a proficiencia/tipo expostos pelo snapshot live como prova de compatibilidade; se o jogo tiver uma restricao especial nao exposta no snapshot, eu prefiro sinalizar isso em vez de inventar regra.');
 
     return lines.join('\n\n');
+  }
+
+  buildHeroSlotRecommendationResponse({
+    analysis,
+    heroSlotRecommendationReview,
+    investigationPlan
+  }) {
+    const requestedHeroName = analysis?.heroName || 'heroi solicitado';
+    const requestedSlotLabel = analysis?.requestedSlot?.label || 'slot solicitado';
+
+    if (!heroSlotRecommendationReview?.liveHero) {
+      return [
+        `Nao consegui confirmar o estado atual do ${requestedHeroName} no jogo, entao nao vou recomendar ${requestedSlotLabel} usando nivel inicial ou dados antigos.`,
+        'Para esse tipo de pergunta eu preciso do snapshot live, porque o nivel atual do heroi e a proficiencia do tipo de item mudam completamente o resultado.'
+      ].join('\n\n');
+    }
+
+    const review = heroSlotRecommendationReview;
+    const hero = review.liveHero;
+    const ownedCandidates = review.ownedCandidates || [];
+    const craftableCandidates = review.craftableCandidates || [];
+    const bestOwned = ownedCandidates[0] || null;
+    const bestCraftable = craftableCandidates[0] || null;
+    const bestOverall = review.bestOverallCandidate || bestOwned || bestCraftable;
+    const lines = [];
+
+    lines.push(`Estado usado na analise: ${hero.name} nivel ${hero.level}, classe ${this.formatHeroClassLabel(hero.heroClass)}, slot pedido ${requestedSlotLabel}, proficiencia ${review.proficiency?.rank || 'desconhecida'} para o tipo ${review.requestedTypeCodes.join('/')}.`);
+
+    if (!bestOverall) {
+      lines.push(`Nao encontrei nenhum ${requestedSlotLabel} real no inventario da loja nem nos itens craftaveis do snapshot live.`);
+      lines.push('Proximo passo seguro: sincronizar o jogo de novo ou conferir se esse tipo de equipamento ja esta desbloqueado/capturado pelo mod antes de eu tentar ranquear alternativas.');
+
+      return lines.join('\n\n');
+    }
+
+    if (bestOwned) {
+      lines.push(`Melhor opcao ja possuida no inventario da loja: ${bestOwned.name} Lv. ${bestOwned.level} em ${bestOwned.qualityLabel} x${bestOwned.quantity}, break chance ${this.formatCandidateBreakChance(bestOwned)}.`);
+    }
+
+    if (bestCraftable) {
+      lines.push(`Melhor opcao craftavel calculada agora: ${bestCraftable.name} Lv. ${bestCraftable.level} em ${bestCraftable.qualityLabel}, break chance ${this.formatCandidateBreakChance(bestCraftable)}.`);
+    }
+
+    if (bestOverall) {
+      const sourceLabel = bestOverall.source === 'inventory' ? 'inventario da loja' : 'craft';
+      lines.push(`Minha recomendacao pratica: ${bestOverall.name} em ${bestOverall.qualityLabel} via ${sourceLabel}. Motivo: ${bestOverall.decisionSummary}.`);
+    }
+
+    const otherOwned = ownedCandidates.slice(1, 4);
+    if (otherOwned.length > 0) {
+      lines.push(`Outras opcoes possuidas consideradas: ${otherOwned.map((candidate) => `${candidate.name} Lv. ${candidate.level} ${candidate.qualityLabel} x${candidate.quantity} (${this.formatCandidateBreakChance(candidate)})`).join('; ')}.`);
+    }
+
+    const otherCraftable = craftableCandidates
+      .filter((candidate) => !bestOwned || this.normalizeLookupText(candidate.name) !== this.normalizeLookupText(bestOwned.name))
+      .slice(0, 4);
+    if (otherCraftable.length > 0) {
+      lines.push(`Outras opcoes craftaveis consideradas: ${otherCraftable.map((candidate) => `${candidate.name} Lv. ${candidate.level} ${candidate.qualityLabel} (${this.formatCandidateBreakChance(candidate)})`).join('; ')}.`);
+    }
+
+    if (investigationPlan?.completedSteps?.length) {
+      lines.push(`O que eu chequei nesta analise: ${investigationPlan.completedSteps.join('; ')}.`);
+    }
+
+    lines.push('Leitura importante: estou usando o nivel atual do heroi na sessao live, nao o nivel inicial do catalogo. O ranking tambem filtra pelo tipo real do item, entao nomes parecidos como wand/string/ring mail nao entram como anel.');
+
+    return lines.join('\n\n');
+  }
+
+  buildHeroSlotRecommendationReview({
+    analysis,
+    snapshot = null,
+    localFullSnapshot = null,
+    localHeroesSnapshot = []
+  }) {
+    if (analysis?.requestType !== 'hero_slot_recommendation' || !analysis?.requestedSlot) {
+      return null;
+    }
+
+    const heroName = String(analysis?.heroName || '').trim();
+    const heroes = Array.isArray(localHeroesSnapshot) && localHeroesSnapshot.length > 0
+      ? localHeroesSnapshot
+      : Array.isArray(localFullSnapshot?.heroes) ? localFullSnapshot.heroes : [];
+    const liveHero = heroes.find((hero) => this.normalizeLookupText(hero?.name) === this.normalizeLookupText(heroName)) || null;
+
+    if (!liveHero) {
+      return {
+        liveHero: null,
+        requestedTypeCodes: analysis.requestedSlot.typeCodes || [],
+        proficiency: null,
+        ownedCandidates: [],
+        craftableCandidates: [],
+        bestOverallCandidate: null
+      };
+    }
+
+    const requestedTypeCodes = this.resolveRequestedSlotTypeCodes({
+      requestedSlot: analysis.requestedSlot,
+      liveHero
+    });
+    const proficiencyByType = this.buildHeroProficiencyMap(liveHero);
+    const catalogItemLevels = this.buildCatalogItemLevelIndex(snapshot?.itemStates || []);
+    const bestProficiency = requestedTypeCodes
+      .map((typeCode) => ({
+        itemTypeCode: typeCode,
+        ...(proficiencyByType.get(typeCode) || { rank: 'Unknown', multiplier: 0 })
+      }))
+      .sort((left, right) => this.scoreProficiencyRank(right.rank) - this.scoreProficiencyRank(left.rank))[0] || null;
+    const craftableItems = (Array.isArray(localFullSnapshot?.craftableItems) ? localFullSnapshot.craftableItems : [])
+      .filter((item) => {
+        return item?.canCraft && requestedTypeCodes.includes(this.normalizeTypeCode(item?.itemTypeCode));
+      })
+      .map((item) => ({
+        uid: String(item?.uid || '').trim(),
+        name: String(item?.name || '').trim(),
+        itemTypeCode: this.normalizeTypeCode(item?.itemTypeCode),
+        level: this.resolveKnownItemLevel({
+          item,
+          catalogItemLevels
+        }) || this.getCandidateItemLevel(item),
+        itemLevel: this.resolveKnownItemLevel({
+          item,
+          catalogItemLevels
+        }) || 0,
+        itemLevelIsReliable: Boolean(this.resolveKnownItemLevel({
+          item,
+          catalogItemLevels
+        })),
+        minQuality: Number(item?.minQuality) || 0,
+        availableByQuality: Array.isArray(item?.availableByQuality) ? item.availableByQuality : [],
+        resourceCosts: Array.isArray(item?.resourceCosts) ? item.resourceCosts : [],
+        itemRequirements: Array.isArray(item?.itemRequirements) ? item.itemRequirements : [],
+        craftingTime: Number(item?.craftingTime) || 0,
+        canCraft: Boolean(item?.canCraft)
+      }));
+    const craftableByKey = this.indexItemsByUidAndName(craftableItems);
+    const inventoryItems = (Array.isArray(localFullSnapshot?.inventoryItems) ? localFullSnapshot.inventoryItems : [])
+      .map((item) => this.normalizeShopInventoryItem(item))
+      .filter((item) => Number(item.totalQuantity) > 0 && requestedTypeCodes.includes(this.normalizeTypeCode(item.itemTypeCode)));
+    const breakChanceReference = localFullSnapshot?.breakChanceReference || null;
+    const ownedCandidates = inventoryItems
+      .flatMap((inventoryItem) => {
+        const craftableItem = this.findIndexedItemByUidOrName(craftableByKey, inventoryItem);
+        const knownInventoryLevel = Number(inventoryItem.itemLevel)
+          || this.resolveKnownItemLevel({ item: inventoryItem, catalogItemLevels });
+        const candidateBase = craftableItem || {
+          uid: inventoryItem.uid,
+          name: inventoryItem.name,
+          itemTypeCode: this.normalizeTypeCode(inventoryItem.itemTypeCode),
+          level: knownInventoryLevel || 0,
+          itemLevel: knownInventoryLevel || 0,
+          itemLevelIsReliable: Boolean(knownInventoryLevel),
+          availableByQuality: inventoryItem.availableByQuality
+        };
+        const enrichedCandidateBase = craftableItem
+          ? {
+              ...craftableItem,
+              level: knownInventoryLevel || craftableItem.level,
+              itemLevel: knownInventoryLevel || craftableItem.itemLevel || 0,
+              itemLevelIsReliable: Boolean(knownInventoryLevel || craftableItem.itemLevelIsReliable)
+            }
+          : candidateBase;
+
+        return inventoryItem.availableByQuality.map((entry) => {
+          const quality = this.mapInventoryTierSortOrderToQuality(entry.quality);
+          return this.buildHeroSlotCandidate({
+            source: 'inventory',
+            candidateItem: enrichedCandidateBase,
+            liveHero,
+            quality,
+            quantity: Number(entry.quantity) || 0,
+            proficiency: proficiencyByType.get(this.normalizeTypeCode(enrichedCandidateBase.itemTypeCode)) || bestProficiency,
+            breakChanceReference
+          });
+        });
+      })
+      .filter(Boolean)
+      .sort((left, right) => this.compareHeroSlotCandidates(left, right));
+    const craftableCandidates = craftableItems
+      .map((craftableItem) => {
+        const quality = this.selectBestSlotQuality({
+          craftableItem,
+          liveHero,
+          proficiency: proficiencyByType.get(this.normalizeTypeCode(craftableItem.itemTypeCode)) || bestProficiency,
+          breakChanceReference
+        });
+
+        return this.buildHeroSlotCandidate({
+          source: 'craft',
+          candidateItem: craftableItem,
+          liveHero,
+          quality,
+          quantity: 0,
+          proficiency: proficiencyByType.get(this.normalizeTypeCode(craftableItem.itemTypeCode)) || bestProficiency,
+          breakChanceReference
+        });
+      })
+      .filter(Boolean)
+      .sort((left, right) => this.compareHeroSlotCandidates(left, right));
+    const bestOverallCandidate = [...ownedCandidates, ...craftableCandidates]
+      .sort((left, right) => this.compareHeroSlotCandidates(left, right))[0] || null;
+
+    return {
+      liveHero: {
+        name: liveHero.name,
+        level: Number(liveHero.level) || 0,
+        heroClass: liveHero.heroClass
+      },
+      requestedTypeCodes,
+      proficiency: bestProficiency,
+      ownedCandidates: ownedCandidates.slice(0, 8),
+      craftableCandidates: craftableCandidates.slice(0, 8),
+      bestOverallCandidate
+    };
   }
 
   buildItemUsabilityReview({
@@ -725,7 +973,8 @@ class AssistantService {
     snapshot,
     localFullSnapshot = null,
     focusedHeroReview,
-    itemUsabilityReview = null
+    itemUsabilityReview = null,
+    heroSlotRecommendationReview = null
   }) {
     const completedSteps = [];
     const pendingSteps = [];
@@ -740,6 +989,27 @@ class AssistantService {
         completedSteps.push('comparei o tipo do item contra as proficiencias dos herois no snapshot live');
       } else {
         pendingSteps.push(`resolver o item alvo ${analysis?.itemName || 'solicitado'} no snapshot live`);
+      }
+    } else if (analysis?.requestType === 'hero_slot_recommendation') {
+      if (heroSlotRecommendationReview?.liveHero) {
+        completedSteps.push(`identifiquei o heroi alvo como ${heroSlotRecommendationReview.liveHero.name}`);
+        completedSteps.push(`usei o nivel live ${heroSlotRecommendationReview.liveHero.level} do heroi`);
+      } else {
+        pendingSteps.push(`resolver o heroi alvo ${analysis?.heroName || 'solicitado'} no snapshot live`);
+      }
+
+      if (heroSlotRecommendationReview?.requestedTypeCodes?.length) {
+        completedSteps.push(`resolvi o slot pedido para o(s) tipo(s) ${heroSlotRecommendationReview.requestedTypeCodes.join('/')}`);
+      } else {
+        pendingSteps.push('resolver o tipo de item do slot pedido');
+      }
+
+      if (heroSlotRecommendationReview?.ownedCandidates?.length) {
+        completedSteps.push(`comparei ${heroSlotRecommendationReview.ownedCandidates.length} candidato(s) possuido(s) no inventario da loja`);
+      }
+
+      if (heroSlotRecommendationReview?.craftableCandidates?.length) {
+        completedSteps.push(`comparei ${heroSlotRecommendationReview.craftableCandidates.length} candidato(s) craftavel(is)`);
       }
     } else if (analysis?.heroName) {
       completedSteps.push(`identifiquei o heroi alvo como ${analysis.heroName}`);
@@ -786,7 +1056,7 @@ class AssistantService {
       pendingSteps.push('ter matriz live de break chance para prever candidatos craftaveis com seguranca');
     }
 
-    if (analysis?.requestType !== 'item_usability_review') {
+    if (!['item_usability_review', 'hero_slot_recommendation'].includes(analysis?.requestType)) {
       pendingSteps.push('ranquear candidatos reais por slot usando afinidade/proficiency e comparacao de break chance');
       pendingSteps.push('comparar tiers de qualidade das alternativas antes do veredito final');
     }
@@ -801,7 +1071,9 @@ class AssistantService {
   inferHeroName({
     prompt,
     snapshot = null,
-    localPlannerOverview = null
+    localPlannerOverview = null,
+    localFullSnapshot = null,
+    localHeroesSnapshot = []
   }) {
     const candidateMap = new Map();
 
@@ -826,6 +1098,17 @@ class AssistantService {
       }
     }
 
+    const liveHeroes = Array.isArray(localHeroesSnapshot) && localHeroesSnapshot.length > 0
+      ? localHeroesSnapshot
+      : Array.isArray(localFullSnapshot?.heroes) ? localFullSnapshot.heroes : [];
+
+    for (const hero of liveHeroes) {
+      const name = String(hero?.name || '').trim();
+      if (name) {
+        candidateMap.set(name.toLowerCase(), name);
+      }
+    }
+
     const lowerPrompt = String(prompt || '').toLowerCase();
 
     for (const [lowerName, originalName] of candidateMap.entries()) {
@@ -835,6 +1118,328 @@ class AssistantService {
     }
 
     return '';
+  }
+
+  inferRequestedEquipmentSlot(prompt) {
+    const lowerPrompt = this.normalizeLookupText(prompt);
+    const slotMatchers = [
+      {
+        key: 'ring',
+        label: 'anel/ring',
+        typeCodes: ['xr'],
+        patterns: [/\banel\b/, /\baneis\b/, /\banels\b/, /\bring\b/, /\brings\b/]
+      },
+      {
+        key: 'amulet',
+        label: 'amuleto/colar',
+        typeCodes: ['xa', 'xn', 'xp'],
+        patterns: [/\bamuleto\b/, /\bcolar\b/, /\bnecklace\b/, /\bamulet\b/]
+      },
+      {
+        key: 'gloves',
+        label: 'luvas/gloves',
+        typeCodes: ['gl'],
+        patterns: [/\bluva\b/, /\bluvas\b/, /\bglove\b/, /\bgloves\b/]
+      },
+      {
+        key: 'boots',
+        label: 'botas/boots',
+        typeCodes: ['bl'],
+        patterns: [/\bbota\b/, /\bbotas\b/, /\bboot\b/, /\bboots\b/, /\bshoes\b/]
+      },
+      {
+        key: 'helmet',
+        label: 'capacete/helmet',
+        typeCodes: ['hl'],
+        patterns: [/\bcapacete\b/, /\belmo\b/, /\bhelmet\b/, /\bhead\b/]
+      },
+      {
+        key: 'body',
+        label: 'armadura/body',
+        typeCodes: ['am', 'ah'],
+        patterns: [/\barmadura\b/, /\barmor\b/, /\barmour\b/, /\bbody\b/, /\bchest\b/]
+      },
+      {
+        key: 'weapon',
+        label: 'arma/weapon',
+        typeCodes: ['wb', 'wd', 'wm', 'ws', 'wt'],
+        patterns: [/\barma\b/, /\bweapon\b/, /\bbow\b/, /\bstaff\b/, /\bwand\b/, /\bsword\b/]
+      },
+      {
+        key: 'usable',
+        label: 'usable',
+        typeCodes: ['us', 'uh', 'uw'],
+        patterns: [/\busable\b/, /\bscroll\b/, /\bpotion\b/]
+      }
+    ];
+
+    return slotMatchers.find((slot) => slot.patterns.some((pattern) => pattern.test(lowerPrompt))) || null;
+  }
+
+  resolveRequestedSlotTypeCodes({
+    requestedSlot,
+    liveHero
+  }) {
+    const requestedTypeCodes = (Array.isArray(requestedSlot?.typeCodes) ? requestedSlot.typeCodes : [])
+      .map((typeCode) => this.normalizeTypeCode(typeCode))
+      .filter(Boolean);
+
+    if (requestedSlot?.key !== 'weapon') {
+      return requestedTypeCodes;
+    }
+
+    const preferredRanks = new Set(['S', 'A']);
+    const liveWeaponTypes = (Array.isArray(liveHero?.proficiencies) ? liveHero.proficiencies : [])
+      .filter((entry) => preferredRanks.has(String(entry?.rank || '').trim().toUpperCase()))
+      .map((entry) => this.normalizeTypeCode(entry?.itemTypeCode))
+      .filter((typeCode) => requestedTypeCodes.includes(typeCode));
+
+    return liveWeaponTypes.length > 0 ? liveWeaponTypes : requestedTypeCodes;
+  }
+
+  indexItemsByUidAndName(items = []) {
+    const itemMap = new Map();
+
+    for (const item of items) {
+      const uid = String(item?.uid || '').trim().toLowerCase();
+      const name = this.normalizeLookupText(item?.name);
+
+      if (uid) {
+        itemMap.set(`uid:${uid}`, item);
+      }
+
+      if (name) {
+        itemMap.set(`name:${name}`, item);
+      }
+    }
+
+    return itemMap;
+  }
+
+  findIndexedItemByUidOrName(itemMap, item) {
+    const uid = String(item?.uid || '').trim().toLowerCase();
+    const name = this.normalizeLookupText(item?.name);
+
+    return (uid ? itemMap.get(`uid:${uid}`) : null)
+      || (name ? itemMap.get(`name:${name}`) : null)
+      || null;
+  }
+
+  buildCatalogItemLevelIndex(itemStates = []) {
+    const itemMap = new Map();
+
+    for (const item of Array.isArray(itemStates) ? itemStates : []) {
+      const level = Number(item?.level) || 0;
+      const externalSlug = String(item?.externalSlug || item?.uid || '').trim().toLowerCase();
+      const name = this.normalizeLookupText(item?.itemName || item?.name);
+
+      if (!level) {
+        continue;
+      }
+
+      if (externalSlug) {
+        itemMap.set(`uid:${externalSlug}`, level);
+      }
+
+      if (name) {
+        itemMap.set(`name:${name}`, level);
+      }
+    }
+
+    return itemMap;
+  }
+
+  resolveKnownItemLevel({
+    item,
+    catalogItemLevels
+  }) {
+    const directLevel = Number(item?.itemLevel) || 0;
+
+    if (directLevel > 0) {
+      return directLevel;
+    }
+
+    const uid = String(item?.uid || item?.externalSlug || '').trim().toLowerCase();
+    const name = this.normalizeLookupText(item?.name || item?.itemName);
+
+    return (uid ? catalogItemLevels.get(`uid:${uid}`) : 0)
+      || (name ? catalogItemLevels.get(`name:${name}`) : 0)
+      || 0;
+  }
+
+  selectBestSlotQuality({
+    craftableItem,
+    liveHero,
+    proficiency,
+    breakChanceReference
+  }) {
+    const enabledQualities = this.listEnabledUserFacingQualities(craftableItem);
+    const rank = String(proficiency?.rank || 'C').trim() || 'C';
+
+    if (!enabledQualities.length) {
+      return 0;
+    }
+
+    if (!breakChanceReference || craftableItem?.itemLevelIsReliable === false) {
+      return enabledQualities.find((quality) => quality >= 4) ?? enabledQualities[enabledQualities.length - 1];
+    }
+
+    for (const quality of enabledQualities) {
+      const breakChance = this.lookupBreakChanceFromReference({
+        breakChanceReference,
+        rank,
+        levelDelta: this.calculateHeroItemLevelDelta({
+          liveHero,
+          candidateItem: craftableItem
+        }),
+        quality
+      });
+
+      if (Number.isFinite(Number(breakChance)) && Number(breakChance) <= 0) {
+        return quality;
+      }
+    }
+
+    return enabledQualities
+      .slice()
+      .sort((left, right) => {
+        const leftBreakChance = this.lookupBreakChanceFromReference({
+          breakChanceReference,
+          rank,
+          levelDelta: this.calculateHeroItemLevelDelta({ liveHero, candidateItem: craftableItem }),
+          quality: left
+        });
+        const rightBreakChance = this.lookupBreakChanceFromReference({
+          breakChanceReference,
+          rank,
+          levelDelta: this.calculateHeroItemLevelDelta({ liveHero, candidateItem: craftableItem }),
+          quality: right
+        });
+
+        const normalizedLeftBreakChance = leftBreakChance !== null && leftBreakChance !== undefined && Number.isFinite(Number(leftBreakChance)) ? Number(leftBreakChance) : 999;
+        const normalizedRightBreakChance = rightBreakChance !== null && rightBreakChance !== undefined && Number.isFinite(Number(rightBreakChance)) ? Number(rightBreakChance) : 999;
+
+        if (normalizedLeftBreakChance !== normalizedRightBreakChance) {
+          return normalizedLeftBreakChance - normalizedRightBreakChance;
+        }
+
+        return Number(left) - Number(right);
+      })[0];
+  }
+
+  buildHeroSlotCandidate({
+    source,
+    candidateItem,
+    liveHero,
+    quality,
+    quantity,
+    proficiency,
+    breakChanceReference
+  }) {
+    if (!candidateItem?.name) {
+      return null;
+    }
+
+    const normalizedTypeCode = this.normalizeTypeCode(candidateItem.itemTypeCode);
+    const rank = String(proficiency?.rank || 'C').trim() || 'C';
+    const hasReliableItemLevel = candidateItem?.itemLevelIsReliable !== false && this.getCandidateItemLevel(candidateItem) > 0;
+    const levelDelta = this.calculateHeroItemLevelDelta({
+      liveHero,
+      candidateItem
+    });
+    const breakChance = breakChanceReference && hasReliableItemLevel
+      ? this.lookupBreakChanceFromReference({
+          breakChanceReference,
+          rank,
+          levelDelta,
+          quality
+        })
+      : null;
+    const adequacy = this.estimateCandidateAdequacy({
+      currentItem: null,
+      currentCraftableItem: null,
+      candidateItem,
+      liveHero
+    });
+    const effort = this.estimateCraftEffort(candidateItem);
+    const sourceBonus = source === 'inventory' ? 35 : 0;
+    const hasKnownBreakChance = breakChance !== null && breakChance !== undefined && Number.isFinite(Number(breakChance));
+    const zeroBonus = hasKnownBreakChance && Number(breakChance) <= 0 ? 180 : 0;
+    const rankBonus = this.scoreProficiencyRank(rank) * 18;
+    const level = this.getCandidateItemLevel(candidateItem);
+    const levelCloseness = Math.max(0, 20 - Math.abs((Number(liveHero?.level) || 0) - level));
+    const qualityBonus = Number(quality) * 14;
+    const breakPenalty = hasKnownBreakChance ? Number(breakChance) * 1000 : 80;
+    const effortPenalty = source === 'craft'
+      ? (effort.resourceCostCount * 0.2) + (effort.itemRequirementCount * 4) + (effort.craftingTimeMs / 90000)
+      : 0;
+    const score = this.roundNumber(
+      sourceBonus
+      + zeroBonus
+      + rankBonus
+      + (level * 3)
+      + levelCloseness
+      + qualityBonus
+      - breakPenalty
+      - effortPenalty,
+      2
+    );
+    const reasons = [
+      `${source === 'inventory' ? 'ja existe no inventario da loja' : 'esta liberado para craft'}`,
+      `proficiencia ${rank} no tipo ${normalizedTypeCode}`,
+      `Lv. ${level} contra heroi Lv. ${Number(liveHero?.level) || 0}`,
+      `${this.formatTierFromQuality(quality)}`,
+      hasReliableItemLevel
+        ? `break chance prevista ${this.formatBreakChancePercent(breakChance)}`
+        : 'break chance sem previsao segura porque falta itemLevel confiavel'
+    ];
+
+    if (source === 'craft' && effort.itemRequirementCount > 0) {
+      reasons.push(`${effort.itemRequirementCount} requisito(s) de item`);
+    }
+
+    return {
+      source,
+      uid: candidateItem.uid,
+      name: candidateItem.name,
+      itemTypeCode: normalizedTypeCode,
+      rank,
+      level,
+      quality,
+      qualityLabel: this.formatTierFromQuality(quality),
+      quantity,
+      breakChance,
+      adequacy,
+      score,
+      decisionSummary: reasons.join(', ')
+    };
+  }
+
+  compareHeroSlotCandidates(left, right) {
+    const leftBreakChance = left?.breakChance !== null && left?.breakChance !== undefined && Number.isFinite(Number(left?.breakChance)) ? Number(left.breakChance) : 999;
+    const rightBreakChance = right?.breakChance !== null && right?.breakChance !== undefined && Number.isFinite(Number(right?.breakChance)) ? Number(right.breakChance) : 999;
+
+    if (leftBreakChance !== rightBreakChance) {
+      return leftBreakChance - rightBreakChance;
+    }
+
+    if (Number(left?.score) !== Number(right?.score)) {
+      return Number(right?.score) - Number(left?.score);
+    }
+
+    if (Number(left?.level) !== Number(right?.level)) {
+      return Number(right?.level) - Number(left?.level);
+    }
+
+    if (Number(left?.quality) !== Number(right?.quality)) {
+      return Number(right?.quality) - Number(left?.quality);
+    }
+
+    if (left?.source !== right?.source) {
+      return left?.source === 'inventory' ? -1 : 1;
+    }
+
+    return String(left?.name || '').localeCompare(String(right?.name || ''));
   }
 
   forwardAbortSignal(sourceSignal, targetController) {
@@ -876,6 +1481,14 @@ class AssistantService {
     }
 
     return `${(numericValue * 100).toFixed(1)}%`;
+  }
+
+  formatCandidateBreakChance(candidate) {
+    if (candidate?.breakChance === null || candidate?.breakChance === undefined || !Number.isFinite(Number(candidate?.breakChance))) {
+      return 'sem previsao segura';
+    }
+
+    return `prevista ${this.formatBreakChancePercent(candidate.breakChance)}`;
   }
 
   normalizeLiveItem(item) {

@@ -261,7 +261,9 @@ async function executeAssistantRun({
 
     const analysis = assistantService.analyzePrompt({
       prompt,
-      localPlannerOverview
+      localPlannerOverview,
+      localFullSnapshot,
+      localHeroesSnapshot
     });
 
     emitRunEvent({
@@ -351,6 +353,47 @@ async function executeAssistantRun({
         stepIndex: 4,
         stepCount: 5,
         message: `Checking which heroes expose proficiency for ${analysis.itemName || 'the requested item'}.`
+      });
+    } else if (analysis.requestType === 'hero_slot_recommendation') {
+      const heroSlotRecommendationReview = assistantService.buildHeroSlotRecommendationReview({
+        analysis,
+        snapshot,
+        localFullSnapshot,
+        localHeroesSnapshot
+      });
+
+      emitRunEvent({
+        type: 'assistant.run.tool_started',
+        toolName: 'hero_slot_candidates',
+        message: `Ranking ${analysis.requestedSlot?.label || 'equipment'} candidates for ${analysis.heroName}.`,
+        inputSummary: {
+          heroName: analysis.heroName,
+          requestedSlot: analysis.requestedSlot?.label || '',
+          liveHeroesAvailable: localHeroesSnapshot.length
+        }
+      });
+
+      emitRunEvent({
+        type: 'assistant.run.tool_finished',
+        toolName: 'hero_slot_candidates',
+        message: heroSlotRecommendationReview?.liveHero
+          ? `${heroSlotRecommendationReview.liveHero.name} matched with ${heroSlotRecommendationReview.ownedCandidates.length} owned and ${heroSlotRecommendationReview.craftableCandidates.length} craftable candidate(s).`
+          : `No live hero snapshot was available for ${analysis.heroName}.`,
+        resultSummary: {
+          heroFound: Boolean(heroSlotRecommendationReview?.liveHero),
+          requestedTypeCodes: heroSlotRecommendationReview?.requestedTypeCodes?.join('/') || '',
+          ownedCandidates: heroSlotRecommendationReview?.ownedCandidates?.length || 0,
+          craftableCandidates: heroSlotRecommendationReview?.craftableCandidates?.length || 0,
+          bestCandidate: heroSlotRecommendationReview?.bestOverallCandidate?.name || ''
+        }
+      });
+
+      emitRunEvent({
+        type: 'assistant.run.progress',
+        phase: 'ranking_candidates',
+        stepIndex: 4,
+        stepCount: 5,
+        message: `Comparing ${analysis.requestedSlot?.label || 'equipment'} candidates against live hero level, proficiency and break chance data.`
       });
     } else if (analysis.heroName) {
       const focusedHeroReview = assistantService.buildFocusedHeroReview({
