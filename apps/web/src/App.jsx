@@ -100,6 +100,21 @@ function normalizeLocalBridgeWebSocketUrl(value) {
   return normalized || LOCAL_BRIDGE_DEFAULT_WS_URL;
 }
 
+function buildLocalBridgeEventsWebSocketUrl(value) {
+  const dataUrl = normalizeLocalBridgeWebSocketUrl(value);
+
+  try {
+    const url = new URL(dataUrl);
+    url.pathname = '/events';
+    url.search = '';
+    url.hash = '';
+
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    return dataUrl.replace(/\/data(?:[?#].*)?$/i, '/events');
+  }
+}
+
 function convertLegacyLocalMcpUrlToBridgeWebSocketUrl(value) {
   const normalized = String(value || '').trim();
 
@@ -531,6 +546,40 @@ async function fetchLocalFullSnapshot(webSocketUrl) {
   });
 }
 
+function isLocalBridgeEventWorthRefreshing(event) {
+  const eventType = String(event?.type || '').trim().toLowerCase();
+  const relevantTypes = new Set([
+    'craft_ready',
+    'craft_collected',
+    'fusion_ready',
+    'fusion_collected',
+    'quest_ready',
+    'quest_collected',
+    'trade_ready',
+    'trade_collected',
+    'trade_updated',
+    'city_trade_ready',
+    'city_trade_collected',
+    'city_trade_updated',
+    'hero_equipment_changed'
+  ]);
+
+  return relevantTypes.has(eventType);
+}
+
+function isLocalBridgeEventWorthSyncingPlanner(event) {
+  const eventType = String(event?.type || '').trim().toLowerCase();
+
+  return [
+    'craft_collected',
+    'fusion_collected',
+    'quest_collected',
+    'trade_collected',
+    'city_trade_collected',
+    'hero_equipment_changed'
+  ].includes(eventType);
+}
+
 function buildLocalPlannerOverviewFromSnapshot(snapshot) {
   const heroes = Array.isArray(snapshot?.heroes) ? snapshot.heroes : [];
   const craftSlots = Array.isArray(snapshot?.craftSlots) ? snapshot.craftSlots : [];
@@ -736,6 +785,8 @@ function App() {
   const catalogSyncItemsRef = useRef(null);
   const assistantSocketRef = useRef(null);
   const assistantSocketConnectPromiseRef = useRef(null);
+  const localBridgeEventsSocketRef = useRef(null);
+  const localBridgeEventRefreshTimeoutRef = useRef(null);
   const assistantRunStatusRef = useRef('idle');
   const assistantRunIdRef = useRef('');
 
@@ -773,6 +824,7 @@ function App() {
 
   useEffect(() => () => {
     closeAssistantSocket();
+    closeLocalBridgeEventsSocket();
   }, []);
 
   useEffect(() => {
@@ -907,6 +959,103 @@ function App() {
     return () => {
       isCancelled = true;
       window.clearInterval(intervalId);
+    };
+  }, [session, accessToken, accounts, selectedAccountId, localBridgeWebSocketUrl, selectedSnapshot, tiers]);
+
+  useEffect(() => {
+    const boundAccount = accounts.find((account) => account.id === selectedAccountId) || null;
+
+    if (!session || !accessToken || !boundAccount || !boundAccount.mcpBindingMode) {
+      closeLocalBridgeEventsSocket();
+      return undefined;
+    }
+
+    if (typeof window === 'undefined' || !window.WebSocket) {
+      return undefined;
+    }
+
+    let isCancelled = false;
+    let reconnectTimeoutId = null;
+    const eventsUrl = buildLocalBridgeEventsWebSocketUrl(localBridgeWebSocketUrl);
+
+    const scheduleRefreshFromEvent = (bridgeEvent) => {
+      window.clearTimeout(localBridgeEventRefreshTimeoutRef.current);
+      localBridgeEventRefreshTimeoutRef.current = window.setTimeout(async () => {
+        if (isCancelled) {
+          return;
+        }
+
+        try {
+          const fullSnapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
+          const normalizedSnapshot = applyLocalFullSnapshot(fullSnapshot);
+
+          if (isLocalBridgeEventWorthSyncingPlanner(bridgeEvent)) {
+            await handleSyncPlannerStateFromLocal({
+              silent: true,
+              suppressLoading: true,
+              localSnapshotOverride: normalizedSnapshot
+            });
+          }
+
+          if (!isCancelled) {
+            setLocalSessionMessage(`Local game event received (${bridgeEvent.type}). Live planner state refreshed.`);
+          }
+        } catch (error) {
+          if (!isCancelled) {
+            setLocalSessionMessage(
+              `${error.message} The local bridge event was received, but the planner could not refresh the live snapshot.`
+            );
+          }
+        }
+      }, 750);
+    };
+
+    const connectEventsSocket = () => {
+      if (isCancelled) {
+        return;
+      }
+
+      const socket = new window.WebSocket(eventsUrl);
+      localBridgeEventsSocketRef.current = socket;
+
+      socket.addEventListener('message', (event) => {
+        let bridgeEvent = null;
+
+        try {
+          bridgeEvent = normalizeBridgePayload(JSON.parse(event.data));
+        } catch {
+          return;
+        }
+
+        if (!isLocalBridgeEventWorthRefreshing(bridgeEvent)) {
+          return;
+        }
+
+        scheduleRefreshFromEvent(bridgeEvent);
+      });
+
+      socket.addEventListener('close', () => {
+        if (localBridgeEventsSocketRef.current === socket) {
+          localBridgeEventsSocketRef.current = null;
+        }
+
+        if (!isCancelled) {
+          reconnectTimeoutId = window.setTimeout(connectEventsSocket, 5000);
+        }
+      });
+
+      socket.addEventListener('error', () => {
+        socket.close();
+      });
+    };
+
+    connectEventsSocket();
+
+    return () => {
+      isCancelled = true;
+      window.clearTimeout(reconnectTimeoutId);
+      window.clearTimeout(localBridgeEventRefreshTimeoutRef.current);
+      closeLocalBridgeEventsSocket();
     };
   }, [session, accessToken, accounts, selectedAccountId, localBridgeWebSocketUrl, selectedSnapshot, tiers]);
 
@@ -1225,6 +1374,19 @@ function App() {
     return allItems;
   }
 
+  function applyLocalFullSnapshot(fullSnapshot) {
+    const normalizedSnapshot = fullSnapshot?.snapshot || fullSnapshot;
+    const descriptor = normalizedSnapshot?.sessionDescriptor || null;
+    const localHeroes = Array.isArray(normalizedSnapshot?.heroes) ? normalizedSnapshot.heroes : [];
+
+    setLocalFullSnapshot(normalizedSnapshot || null);
+    setLocalHeroesSnapshot(localHeroes);
+    setLocalSessionDescriptor(descriptor);
+    setLocalPlannerOverview(normalizedSnapshot ? buildLocalPlannerOverviewFromSnapshot(normalizedSnapshot) : null);
+
+    return normalizedSnapshot;
+  }
+
   async function handleDetectLocalSession(options = {}) {
     const {
       silent = false,
@@ -1248,10 +1410,7 @@ function App() {
         throw new Error('Local Shop Heroes bridge did not expose a session descriptor yet.');
       }
 
-      setLocalSessionDescriptor(descriptor);
-      setLocalFullSnapshot(fullSnapshot);
-      setLocalHeroesSnapshot(Array.isArray(fullSnapshot?.heroes) ? fullSnapshot.heroes : []);
-      setLocalPlannerOverview(buildLocalPlannerOverviewFromSnapshot(fullSnapshot));
+      applyLocalFullSnapshot(fullSnapshot);
 
       if (applyToForm) {
         setAccountForm((currentValue) => ({
@@ -1351,14 +1510,7 @@ function App() {
 
     try {
       const fullSnapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
-      const overview = buildLocalPlannerOverviewFromSnapshot(fullSnapshot);
-      setLocalPlannerOverview(overview);
-      if (fullSnapshot) {
-        const normalizedSnapshot = fullSnapshot?.snapshot || fullSnapshot;
-        const localHeroes = Array.isArray(normalizedSnapshot?.heroes) ? normalizedSnapshot.heroes : [];
-        setLocalFullSnapshot(normalizedSnapshot);
-        setLocalHeroesSnapshot(localHeroes);
-      }
+      applyLocalFullSnapshot(fullSnapshot);
       setLocalSessionMessage('Local planner overview refreshed from the running game session.');
     } catch (error) {
       setLocalPlannerOverview(null);
@@ -1388,10 +1540,8 @@ function App() {
 
     try {
       const fullSnapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
-      const normalizedSnapshot = fullSnapshot?.snapshot || fullSnapshot;
+      const normalizedSnapshot = applyLocalFullSnapshot(fullSnapshot);
       const localHeroes = Array.isArray(normalizedSnapshot?.heroes) ? normalizedSnapshot.heroes : [];
-      setLocalFullSnapshot(normalizedSnapshot);
-      setLocalHeroesSnapshot(localHeroes);
       const accountCharacters = Array.isArray(selectedSnapshot.characters) ? selectedSnapshot.characters : [];
       const characterByKey = new Map();
 
@@ -1463,7 +1613,7 @@ function App() {
       return;
     }
 
-    const { silent = false, suppressLoading = false } = options;
+    const { silent = false, suppressLoading = false, localSnapshotOverride = null } = options;
 
     if (!silent) {
       setErrorMessage('');
@@ -1475,13 +1625,11 @@ function App() {
     }
 
     try {
-      const fullSnapshot = await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
-
-      const normalizedSnapshot = fullSnapshot?.snapshot || fullSnapshot;
+      const fullSnapshot = localSnapshotOverride || await fetchLocalFullSnapshot(localBridgeWebSocketUrl);
+      const normalizedSnapshot = applyLocalFullSnapshot(fullSnapshot);
       const localHeroes = Array.isArray(normalizedSnapshot?.heroes) ? normalizedSnapshot.heroes : [];
       const localCraftableItems = Array.isArray(normalizedSnapshot?.craftableItems) ? normalizedSnapshot.craftableItems : [];
       const localInventoryItems = Array.isArray(normalizedSnapshot?.inventoryItems) ? normalizedSnapshot.inventoryItems : [];
-      setLocalHeroesSnapshot(localHeroes);
 
       const accountCharacters = Array.isArray(selectedSnapshot.characters) ? selectedSnapshot.characters : [];
       const characterByKey = new Map();
@@ -1874,6 +2022,15 @@ function App() {
 
     assistantSocketConnectPromiseRef.current = null;
     setAssistantConnectionState('disconnected');
+  }
+
+  function closeLocalBridgeEventsSocket() {
+    window.clearTimeout(localBridgeEventRefreshTimeoutRef.current);
+
+    if (localBridgeEventsSocketRef.current) {
+      localBridgeEventsSocketRef.current.close();
+      localBridgeEventsSocketRef.current = null;
+    }
   }
 
   function handleCancelAssistantRun() {
